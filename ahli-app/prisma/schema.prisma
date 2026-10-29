@@ -1,0 +1,401 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role { FAMILY PROVIDER ADMIN }
+enum ProviderKind { DOCTOR CLEANER CHEF CARE_WORKER }
+enum ProviderStatus { PENDING UNDER_REVIEW VERIFIED REJECTED SUSPENDED }
+enum VerificationKind { IDENTITY PROFESSION BACKGROUND }
+enum VerificationStatus { PENDING APPROVED REJECTED }
+enum SubStatus { PENDING_PAYMENT ACTIVE PAUSED CANCELLED }
+enum PayProvider { BANK_TRANSFER STRIPE PAYPAL }
+enum PayStatus { PENDING VERIFIED FAILED REFUNDED }
+enum ServiceType { CLEANING DOCTOR_VISIT CHEF MEDICATION_PICKUP }
+enum ServiceStatus { PENDING CONFIRMED ASSIGNED IN_PROGRESS COMPLETED CANCELLED ISSUE_REPORTED }
+enum AssignmentStatus { OFFERED ACCEPTED REJECTED COMPLETED }
+enum EvidenceKind { COMPLETION_PHOTO MEAL_PHOTO PHARMACY_RECEIPT VISIT_CONFIRMATION }
+enum MedStatus { RECEIVED IN_REVIEW PHARMACY_CONTACTED PRICE_CONFIRMED AWAITING_APPROVAL ACQUIRED PROOF_UPLOADED COMPLETED DECLINED }
+enum PayoutStatus { PENDING PAID }
+enum TicketStatus { OPEN IN_REVIEW WAITING_INFO RESOLVED CLOSED }
+enum Severity { LOW MEDIUM HIGH }
+
+// ---------- Identity and access ----------
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  passwordHash    String?   // null for accounts that only use Google
+  name            String
+  role            Role     @default(FAMILY)
+  emailVerifiedAt DateTime?
+  disabledAt      DateTime?
+  createdAt       DateTime @default(now())
+  sessions        Session[]
+  accounts        Account[]
+  customerNotes   CustomerNote[]
+  family          FamilyMember?
+  provider        Provider?
+  recipients      CareRecipient[]
+  subscriptions   Subscription[]
+  payments        Payment[]
+  reviews         Review[]
+  notifications   Notification[]
+  tickets         SupportTicket[]
+  terms           TermsAcceptance[]
+  evidence        ServiceEvidence[]
+  medRequests     MedicationRequest[]
+}
+// Only a SHA-256 hash of the session token is stored, never the token itself.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+model TermsAcceptance {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document   String   // terms | privacy | medical-disclaimer
+  version    String
+  ip         String?
+  acceptedAt DateTime @default(now())
+}
+model FamilyMember {
+  id      String  @id @default(cuid())
+  userId  String  @unique
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  country String?
+  phone   String?
+}
+
+// ---------- Care recipient ----------
+model CareRecipient {
+  id                String   @id @default(cuid())
+  ownerId           String
+  owner             User     @relation(fields: [ownerId], references: [id])
+  fullName          String
+  birthYear         Int?
+  address           String
+  city              String
+  phone             String
+  careNotes         String?  // keep minimal; never shown to providers beyond need
+  preferences       Json?    // chef: cuisine, allergies, foods to avoid, meal frequency
+  emergencyContacts EmergencyContact[]
+  subscriptions     Subscription[]
+  services          Service[]
+  medications       Medication[]
+  medRequests       MedicationRequest[]
+}
+model EmergencyContact {
+  id          String @id @default(cuid())
+  recipientId String
+  recipient   CareRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  name        String
+  phone       String
+  relation    String?
+}
+
+// ---------- Plans, pricing, billing ----------
+model Plan {
+  id               String  @id @default(cuid())
+  key              String  @unique // essential | care | complete
+  name             String
+  doctorVisits     Int
+  cleaningVisits   Int
+  chefVisits       Int     @default(0)
+  medAllowance     Decimal @default(0) @db.Decimal(12, 3)
+  priorityReserve  Decimal @default(0) @db.Decimal(12, 3) // priority consultation allocation
+  coordinationCost Decimal @db.Decimal(12, 3)
+  active           Boolean @default(true)
+  subscriptions    Subscription[]
+}
+// Prices are computed from this, never hardcoded. Change a row to reprice new subscriptions.
+model PricingConfiguration {
+  id              String   @id @default(cuid())
+  platformFeeBps  Int      @default(700) // 7%
+  contingencyBps  Int      @default(800)
+  unitCosts       Json     // { clean, doc, chef } in TND
+  effectiveFrom   DateTime @default(now())
+  createdById     String?
+}
+model Subscription {
+  id                String    @id @default(cuid())
+  userId            String
+  user              User      @relation(fields: [userId], references: [id])
+  recipientId       String
+  recipient         CareRecipient @relation(fields: [recipientId], references: [id])
+  planId            String
+  plan              Plan      @relation(fields: [planId], references: [id])
+  status            SubStatus @default(PENDING_PAYMENT)
+  priceSnapshot     Decimal   @db.Decimal(12, 3) // price agreed at signup
+  allowanceSnapshot Decimal   @db.Decimal(12, 3)
+  startsAt          DateTime?
+  pausedAt          DateTime?
+  cancelledAt       DateTime?
+  createdAt         DateTime  @default(now())
+  payments          Payment[]
+  invoices          Invoice[]
+  services          Service[]
+}
+model Payment {
+  id             String      @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+  userId         String
+  user           User        @relation(fields: [userId], references: [id])
+  provider       PayProvider
+  status         PayStatus   @default(PENDING)
+  amount         Decimal     @db.Decimal(12, 3)
+  reference      String      @unique // bank transfer reference
+  receiptKey     String?     // private storage key
+  externalId     String?     // Stripe/PayPal id, never card data
+  verifiedById   String?
+  verifiedAt     DateTime?
+  createdAt      DateTime    @default(now())
+  invoice        Invoice?
+}
+model Invoice {
+  id             String   @id @default(cuid())
+  number         String   @unique
+  subscriptionId String
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+  paymentId      String?  @unique
+  payment        Payment? @relation(fields: [paymentId], references: [id])
+  amount         Decimal  @db.Decimal(12, 3)
+  periodStart    DateTime
+  periodEnd      DateTime
+  issuedAt       DateTime @default(now())
+}
+
+// ---------- Providers ----------
+model Provider {
+  id            String         @id @default(cuid())
+  userId        String         @unique
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind          ProviderKind
+  status        ProviderStatus @default(PENDING)
+  displayName   String
+  bio           String?
+  verifications ProviderVerification[]
+  assignments   ServiceAssignment[]
+  payouts       ProviderPayout[]
+  events        ProviderStatusEvent[]
+  categories    String[]
+  available     Boolean        @default(true)
+}
+// A badge is shown only for an APPROVED row. Nothing is displayed that AHLI has not verified.
+model ProviderVerification {
+  id          String             @id @default(cuid())
+  providerId  String
+  provider    Provider           @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  kind        VerificationKind
+  status      VerificationStatus @default(PENDING)
+  documentKey String             // private storage key
+  reviewedById String?
+  reviewedAt  DateTime?
+  createdAt   DateTime           @default(now())
+}
+
+// ---------- Services and evidence ----------
+model Service {
+  id             String        @id @default(cuid())
+  subscriptionId String
+  subscription   Subscription  @relation(fields: [subscriptionId], references: [id])
+  recipientId    String
+  recipient      CareRecipient @relation(fields: [recipientId], references: [id])
+  type           ServiceType
+  status         ServiceStatus @default(PENDING)
+  scheduledAt    DateTime
+  completedAt    DateTime?
+  familyNote     String?       // visible to the family
+  assignments    ServiceAssignment[]
+  evidence       ServiceEvidence[]
+  doctorVisit    DoctorVisit?
+  cleaningVisit  CleaningVisit?
+  chefVisit      ChefVisit?
+  review         Review?
+  @@index([recipientId, scheduledAt])
+}
+model ServiceAssignment {
+  id           String           @id @default(cuid())
+  serviceId    String
+  service      Service          @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  providerId   String
+  provider     Provider         @relation(fields: [providerId], references: [id])
+  status       AssignmentStatus @default(OFFERED)
+  respondedAt  DateTime?
+  payoutAmount Decimal          @db.Decimal(12, 3)
+  payout       ProviderPayout?
+  @@unique([serviceId, providerId])
+}
+// Access through signed, expiring URLs only. No evidence photo should show the resident.
+model ServiceEvidence {
+  id           String       @id @default(cuid())
+  serviceId    String
+  service      Service      @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  uploadedById String
+  uploadedBy   User         @relation(fields: [uploadedById], references: [id])
+  kind         EvidenceKind
+  storageKey   String
+  mimeType     String
+  sizeBytes    Int
+  createdAt    DateTime     @default(now())
+}
+model DoctorVisit {
+  id               String  @id @default(cuid())
+  serviceId        String  @unique
+  service          Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  visitType        String
+  familySummary    String? // the only medical text the family sees
+  clinicalNotesEnc String? // application-level encrypted; never sent to the family dashboard
+  followUp         String?
+}
+model CleaningVisit {
+  id              String  @id @default(cuid())
+  serviceId       String  @unique
+  service         Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  areas           String?
+  problemReported Boolean @default(false)
+}
+model ChefVisit {
+  id        String  @id @default(cuid())
+  serviceId String  @unique
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  meals     String?
+}
+
+// ---------- Medication ----------
+model Medication {
+  id          String  @id @default(cuid())
+  recipientId String
+  recipient   CareRecipient @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  name        String
+  dosage      String
+  active      Boolean @default(true)
+  requests    MedicationRequest[]
+}
+model MedicationRequest {
+  id              String    @id @default(cuid())
+  recipientId     String
+  recipient       CareRecipient @relation(fields: [recipientId], references: [id])
+  medicationId    String?
+  medication      Medication? @relation(fields: [medicationId], references: [id])
+  requestedById   String
+  requestedBy     User      @relation(fields: [requestedById], references: [id])
+  status          MedStatus @default(RECEIVED)
+  prescriptionKey String?   // private storage key
+  estimatedCost   Decimal?  @db.Decimal(12, 3)
+  actualCost      Decimal?  @db.Decimal(12, 3)
+  extraAmount     Decimal?  @db.Decimal(12, 3) // above allowance; needs family approval
+  approvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+}
+
+// ---------- Reviews, support, money out ----------
+// One review per completed service. App code must check: service COMPLETED, author owns the
+// subscription, and author is not the assigned provider.
+model Review {
+  id        String   @id @default(cuid())
+  serviceId String   @unique
+  service   Service  @relation(fields: [serviceId], references: [id])
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  rating    Int
+  comment   String?
+  createdAt DateTime @default(now())
+}
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+model SupportTicket {
+  id        String       @id @default(cuid())
+  userId    String
+  user      User         @relation(fields: [userId], references: [id])
+  subject   String
+  body      String
+  status    TicketStatus @default(OPEN)
+  severity  Severity     @default(MEDIUM)
+  serviceId String?
+  assignedToId String?   // admin user id (no FK on purpose: keeps audit data if the admin is removed)
+  resolution String?
+  createdAt DateTime     @default(now())
+  notes     TicketNote[]
+}
+model ProviderPayout {
+  id           String           @id @default(cuid())
+  providerId   String
+  provider     Provider         @relation(fields: [providerId], references: [id])
+  assignmentId String           @unique
+  assignment   ServiceAssignment @relation(fields: [assignmentId], references: [id])
+  amount       Decimal          @db.Decimal(12, 3) // owed to provider
+  platformFee  Decimal          @db.Decimal(12, 3) // AHLI fee attributable to this service
+  status       PayoutStatus     @default(PENDING)
+  paidAt       DateTime?
+}
+
+// Link between an AHLI user and an external identity (Google). "sub" is Google's stable user id.
+model Account {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          String
+  providerAccountId String
+  createdAt         DateTime @default(now())
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// ---------- Admin ----------
+// Append-only record of sensitive admin actions. Never put passwords, tokens or medical details in meta.
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String   // user id, or "system" for scripts
+  action    String
+  entity    String
+  entityId  String
+  meta      Json?
+  ip        String?
+  createdAt DateTime @default(now())
+  @@index([createdAt])
+  @@index([entity, entityId])
+}
+model CustomerNote {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  authorId   String
+  body       String
+  createdAt  DateTime @default(now())
+}
+model TicketNote {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String
+  body      String        // internal only, never shown to the customer
+  createdAt DateTime      @default(now())
+}
+model ProviderStatusEvent {
+  id         String         @id @default(cuid())
+  providerId String
+  provider   Provider       @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  fromStatus ProviderStatus?
+  toStatus   ProviderStatus
+  reason     String?
+  actorId    String
+  createdAt  DateTime       @default(now())
+}
